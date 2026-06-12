@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>NVB alert — UI switcher v2 (instrument + nerve segmentation)</title>
+
+<!-- ================= CONFIG (edit numbers here only) ================= -->
+<script>
+  const CONFIG = {
+    videoSrc: "clip.mp4",
+    clipStart: 0,    // clip begins at 0
+    clipEnd:   20,   // 20s clip
+    energyOn:  [[5, 18]],
+    nearNerve: [[7, 18]],
+    burns: [[9.3,10.4],[11.6,12.0],[15,16],[17.2,17.4]],  // burn windows (s into clip); EF steps down during each
+    threshold: 65,
+    riseFast:  8, riseSlow: 2, decay: 5,
+    startStyle: "bar",   // "bar" | "circle"
+    startLevel: 1,       // 1 meter, 2 +segmentation, 3 +panel
+
+    // Erectile function on the SHIM scale (0-25)
+    baselineEF: 20,   // patient's pre-op SHIM score; entered at the start gate
+    efMid: 32,        // dose % at the midpoint of the drop (drop is centred mid-clip)
+    efSteep: 0.15,    // steepness: holds early, drops in the middle, plateaus at the end
+    efFloor: 5,       // EF bottoms out here, never drops all the way to 0
+    efIntact: 17,     // SHIM at/above which EF counts as intact (paper threshold)
+  };
+</script>
+
+<style>
+  *{box-sizing:border-box;}
+  body{margin:0;background:#08090c;color:#e8eaed;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;display:flex;flex-direction:column;align-items:center;min-height:100vh;}
+  #stage{position:relative;display:inline-block;line-height:0;max-width:100vw;max-height:86vh;}
+  video{display:block;max-width:100vw;max-height:86vh;background:#000;}
+  #overlay{position:absolute;inset:0;pointer-events:none;line-height:1.45;}
+  #edge{position:absolute;inset:0;border:5px solid transparent;border-radius:4px;transition:border-color .3s,box-shadow .3s;}
+
+  #meterBar{position:absolute;top:14px;right:14px;width:200px;}
+  #meterBar .row{display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;}
+  #barTrack{position:relative;height:18px;border-radius:9px;overflow:hidden;display:flex;}
+  #barMask{position:absolute;top:0;right:0;height:100%;background:rgba(8,9,12,.82);transition:width .08s linear;}
+  #meterCircle{position:absolute;top:12px;right:14px;width:128px;display:none;text-align:center;}
+
+  .glass{background:rgba(10,14,19,.40);border:1px solid rgba(120,150,175,.30);border-radius:10px;backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);pointer-events:auto;}
+  #panel{position:absolute;left:50%;transform:translateX(-50%);bottom:16px;width:188px;padding:10px;display:none;}
+  #phasePanel{position:absolute;left:0;top:0;height:100%;width:160px;padding:18px 13px;display:none;flex-direction:column;border-radius:0;border:none;border-right:1px solid rgba(120,150,175,.28);}
+  #anatomyPanel{position:absolute;right:14px;top:50%;transform:translateY(-50%);width:210px;padding:12px;display:none;text-align:center;}
+  #panel h4,#phasePanel h4,#anatomyPanel h4{margin:0 0 9px;font-size:11px;letter-spacing:1px;color:#9fb2c2;font-weight:500;}
+  .swrow{display:flex;align-items:center;justify-content:space-between;font-size:12px;padding:5px 0;cursor:pointer;color:#e2e8ee;}
+  .sw{width:30px;height:15px;border-radius:8px;position:relative;flex:none;}
+  .sw .knob{position:absolute;top:2px;width:11px;height:11px;border-radius:50%;background:#fff;transition:left .15s;}
+  .sw.on{background:#1f8a4c;} .sw.on .knob{left:17px;}
+  .sw.off{background:#33424d;} .sw.off .knob{left:2px;}
+  .phrow{display:flex;align-items:center;gap:8px;font-size:11.5px;color:#9aa6b0;padding:3px 0;}
+  .phrow .dot{width:10px;height:10px;border-radius:50%;background:#33424d;flex:none;}
+  .phrow.done{color:#8693a0;} .phrow.done .dot{background:#2a6b4a;}
+  .phrow.cur{color:#fff;font-weight:500;} .phrow.cur .dot{background:#3fa0e0;box-shadow:0 0 0 3px rgba(63,160,224,.3);}
+  .imgtile{flex:1;border:1px solid rgba(150,170,190,.4);border-radius:5px;padding:9px 0;font-size:10px;color:#aeb9c4;cursor:pointer;}
+  .imgtile:hover{border-color:#85b7eb;color:#cde4fb;}
+
+  #endcard{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(6,7,10,.9);pointer-events:auto;}
+  #endinner{width:62%;max-width:430px;border-radius:14px;padding:26px;text-align:center;border:2px solid #e24b4a;background:#140d0d;}
+  #endinner.good{border-color:#1d9e75;background:#0c1410;}
+  #endbadge{width:62px;height:62px;border-radius:50%;background:#a32d2d;display:flex;align-items:center;justify-content:center;margin:8px auto 12px;font-size:32px;}
+  #endinner.good #endbadge{background:#0f6e56;}
+  #endstats{display:flex;gap:8px;margin-top:16px;}
+  #endstats>div{flex:1;background:rgba(255,255,255,.05);border-radius:8px;padding:8px;}
+
+  .controls{display:flex;align-items:center;gap:13px;margin:14px;width:100%;max-width:900px;}
+  button{background:#1b212a;color:#e8eaed;border:1px solid #333b47;border-radius:8px;padding:8px 13px;font-size:14px;cursor:pointer;}
+  button:hover{background:#232b36;}
+  input[type=range]{flex:1;accent-color:#e24b4a;}
+  .clock{font-size:14px;color:#9aa0a6;min-width:110px;text-align:right;font-variant-numeric:tabular-nums;}
+  .hint{font-size:12px;color:#6b7178;margin:0 14px 20px;max-width:940px;text-align:center;line-height:1.7;}
+  kbd{background:#1b212a;border:1px solid #333b47;border-radius:4px;padding:1px 6px;font-size:11px;}
+  #cal{position:absolute;top:50px;left:14px;display:none;background:rgba(10,13,18,.85);border:1px solid #333b47;border-radius:8px;padding:8px 11px;font-size:13px;font-family:ui-monospace,Consolas,monospace;}
+  #styletag{position:absolute;bottom:12px;right:14px;font-size:12px;color:#aab0b6;background:rgba(10,13,18,.7);padding:3px 9px;border-radius:8px;}
+
+  @keyframes pulseRed{0%,100%{opacity:.3}50%{opacity:.85}}
+  @keyframes pulseInstr{0%,100%{opacity:.5}50%{opacity:.78}}
+  .glow{animation:pulseRed 1s infinite;}
+  .energized{animation:pulseInstr .7s infinite;}
+  @keyframes halo{0%,100%{opacity:.5}50%{opacity:.12}}
+  .redpulse{animation:halo 1.1s infinite;}
+  #seg g{cursor:move;}
+  .t2{position:relative;height:14px;border-radius:7px;overflow:hidden;background:#161b22;display:flex;}
+  .efFill{height:100%;border-radius:7px;transition:width .08s linear,background .2s;}
+  .tick{position:absolute;top:0;height:100%;width:1.5px;background:rgba(255,255,255,.22);}
+  .mrow{display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="vid" src="" preload="metadata" playsinline></video>
+
+  <div id="overlay">
+    <div id="edge"></div>
+    <div id="cal">clip <b id="crel">0.0</b>s / <span id="cdur">20</span>s &nbsp; full <b id="cabs">0:00</b></div>
+
+    <div id="meterBar">
+      <div style="text-align:right;margin-bottom:4px;line-height:1;"><span id="barNumV" style="font-size:17px;font-weight:500;color:#fff;">20</span><span style="font-size:11px;color:#9aa0a6;"> / 25</span></div>
+      <div class="t2" style="height:16px;border-radius:8px;background:rgba(8,9,12,.5);">
+        <div id="efFill" style="height:100%;width:80%;background:#1d9e75;border-radius:8px;transition:width .1s linear,background .25s;"></div>
+      </div>
+    </div>
+
+    <div id="meterCircle">
+      <svg viewBox="0 0 100 100" width="120" height="120">
+        <circle cx="50" cy="50" r="40" fill="none" stroke="#161b22" stroke-width="11"/>
+        <circle id="cFill" cx="50" cy="50" r="40" fill="none" stroke="#1d9e75" stroke-width="11" stroke-linecap="round" stroke-dasharray="251.3" stroke-dashoffset="50.3" transform="rotate(-90 50 50)"/>
+        <circle id="cThresh" cx="13.8" cy="67" r="2.6" fill="#fff"/>
+        <text id="cEF" x="50" y="47" text-anchor="middle" font-size="20" fill="#fff" font-weight="500">20</text>
+        <text x="50" y="60" text-anchor="middle" font-size="8.5" fill="#9aa0a6">EF /25 &#9660;</text>
+      </svg>
+      <div id="cDose" style="font-size:11px;color:#9aa0a6;margin-top:-6px;">intact &#8805; 17</div>
+    </div>
+
+    <!-- ===== SEGMENTATION v2: instrument masks + yellow nerve ===== -->
+    <svg id="seg" width="100%" height="100%" viewBox="0 0 640 360" preserveAspectRatio="none" style="position:absolute;inset:0;display:none;pointer-events:none;">
+      <defs>
+        <filter id="soft" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="3"/></filter>
+        <filter id="redhalo" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="6"/></filter>
+      </defs>
+
+      <!-- LEFT instrument: bipolar forceps (green) -->
+      <g id="instrL" style="pointer-events:auto;">
+        <g opacity="0.4" filter="url(#soft)">
+          <path d="M -30 250 L 175 244 L 178 256 L -30 272 Z" fill="#3ecf8e"/>
+          <path d="M 172 240 Q 230 214 268 208 L 272 224 Q 232 230 188 252 Z" fill="#3ecf8e"/>
+          <path d="M 172 258 Q 232 262 276 266 L 272 282 Q 230 280 180 266 Z" fill="#3ecf8e"/>
+        </g>
+        <path d="M -30 252 L 150 248" stroke="#a9f5cf" stroke-width="4" opacity="0.5" fill="none"/>
+        <g stroke="#5dffae" stroke-width="2.5" opacity="0.9">
+          <path d="M 262 200 l 0 12 M 256 206 l 12 0"/>
+          <path d="M 270 264 l 0 12 M 264 270 l 12 0"/>
+          <path d="M 150 250 l 0 10 M 145 255 l 10 0"/>
+        </g>
+      </g>
+
+      <!-- RIGHT instrument: monopolar scissors (purple) -->
+      <g id="instrR" style="pointer-events:auto;">
+        <g opacity="0.4" filter="url(#soft)">
+          <path d="M 680 250 L 470 286 L 466 304 L 680 290 Z" fill="#b18cf0"/>
+          <path d="M 470 286 Q 430 296 408 304 L 416 318 Q 446 308 474 300 Z" fill="#b18cf0"/>
+        </g>
+        <path d="M 680 268 L 470 296" stroke="#dcc7ff" stroke-width="4" opacity="0.5" fill="none"/>
+        <g stroke="#caa8ff" stroke-width="2.5" opacity="0.85">
+          <path d="M 410 300 l 0 12 M 404 306 l 12 0"/>
+        </g>
+      </g>
+
+      <!-- NERVE: yellow telestration strokes (like the 2nd reference) -->
+      <g id="nerve" style="pointer-events:auto;">
+        <g filter="url(#redhalo)" opacity="0.5">
+          <path d="M 268 236 L 332 256" stroke="#ffe24b" stroke-width="13" stroke-linecap="round"/>
+          <path d="M 258 256 L 342 268" stroke="#ffe24b" stroke-width="13" stroke-linecap="round"/>
+          <path d="M 276 274 L 346 282" stroke="#ffe24b" stroke-width="13" stroke-linecap="round"/>
+        </g>
+        <g id="nerveGlow" style="display:none;" filter="url(#redhalo)">
+          <path d="M 268 236 L 332 256" stroke="#ff2d2d" stroke-width="14" stroke-linecap="round"/>
+          <path d="M 258 256 L 342 268" stroke="#ff2d2d" stroke-width="14" stroke-linecap="round"/>
+          <path d="M 276 274 L 346 282" stroke="#ff2d2d" stroke-width="14" stroke-linecap="round"/>
+        </g>
+        <g stroke="#ffd400" stroke-width="8" stroke-linecap="round" fill="none">
+          <path d="M 268 236 L 332 256"/>
+          <path d="M 258 256 L 342 268"/>
+          <path d="M 276 274 L 346 282"/>
+          <path d="M 300 230 L 286 250"/>
+        </g>
+      </g>
+    </svg>
+
+    <div id="panel" class="glass">
+      <h4>LAYERS</h4>
+      <div class="swrow" data-k="meter"><span>Meter <kbd>1</kbd></span><span class="sw on"><span class="knob"></span></span></div>
+      <div class="swrow" data-k="seg"><span>Segmentation <kbd>2</kbd></span><span class="sw off"><span class="knob"></span></span></div>
+      <div class="swrow" data-k="phase"><span>Surgical phase <kbd>3</kbd></span><span class="sw off"><span class="knob"></span></span></div>
+      <div class="swrow" data-k="anatomy"><span>Anatomy <kbd>4</kbd></span><span class="sw off"><span class="knob"></span></span></div>
+      <div class="swrow" data-k="sound"><span>Sound</span><span class="sw off"><span class="knob"></span></span></div>
+    </div>
+
+    <div id="phasePanel" class="glass">
+      <h4>SURGICAL PHASE</h4>
+      <div style="display:flex;gap:11px;flex:1;min-height:0;">
+        <div style="width:8px;background:rgba(255,255,255,.10);border-radius:4px;position:relative;">
+          <div id="phaseFill" style="position:absolute;top:0;width:100%;height:58%;background:#3fa0e0;border-radius:4px;"></div>
+        </div>
+        <div style="flex:1;display:flex;flex-direction:column;justify-content:space-around;">
+          <div class="phrow done"><span class="dot"></span>Bladder neck</div>
+          <div class="phrow done"><span class="dot"></span>Seminal vesicles</div>
+          <div class="phrow done"><span class="dot"></span>Posterior plane</div>
+          <div class="phrow cur"><span class="dot"></span>Nerve sparing</div>
+          <div class="phrow"><span class="dot"></span>Apical dissection</div>
+          <div class="phrow"><span class="dot"></span>Anastomosis</div>
+        </div>
+      </div>
+      <div style="margin-top:11px;font-size:11px;color:#9aa6b0;">Est. time remaining</div>
+      <div id="phaseTime" style="font-size:18px;color:#fff;font-weight:500;">~ 44 min</div>
+    </div>
+
+    <div id="anatomyPanel" class="glass">
+      <h4>ANATOMY REFERENCE</h4>
+      <div id="anatView" style="position:relative;min-height:150px;display:flex;align-items:center;justify-content:center;">
+      <div id="anatSketch">
+      <svg viewBox="0 0 210 252" width="100%" style="max-width:200px;" font-family="sans-serif">
+        <!-- bladder -->
+        <path d="M 70 58 Q 70 20 108 20 Q 146 20 146 58 Q 146 70 108 73 Q 70 70 70 58 Z" fill="rgba(150,180,220,.10)" stroke="#b8c6d2" stroke-width="1.2"/>
+        <text x="150" y="34" font-size="8" fill="#aebcc8">Bladder</text>
+        <!-- seminal vesicles + vas -->
+        <path d="M 78 72 q -10 4 -8 16 q 9 5 14 -3 q 0 -10 -6 -13" fill="none" stroke="#b8c6d2" stroke-width="1"/>
+        <path d="M 138 72 q 10 4 8 16 q -9 5 -14 -3 q 0 -10 6 -13" fill="none" stroke="#b8c6d2" stroke-width="1"/>
+        <text x="150" y="92" font-size="8" fill="#aebcc8">Sem. vesicle</text>
+        <!-- prostate -->
+        <path d="M 108 76 Q 72 80 70 112 Q 70 146 108 156 Q 146 146 146 112 Q 144 80 108 76 Z" fill="rgba(120,150,200,.14)" stroke="#cdd8e2" stroke-width="1.3"/>
+        <text x="150" y="120" font-size="8" fill="#aebcc8">Prostate</text>
+        <!-- urethra -->
+        <path d="M 108 92 L 108 204" fill="none" stroke="#9fb0bd" stroke-width="1" stroke-dasharray="2 3"/>
+        <!-- neurovascular bundles -->
+        <path d="M 74 98 Q 60 132 82 180" fill="none" stroke="#e0a84e" stroke-width="2.4" stroke-linecap="round"/>
+        <path d="M 142 98 Q 156 132 134 180" fill="none" stroke="#e0a84e" stroke-width="2.4" stroke-linecap="round"/>
+        <text x="6" y="100" font-size="8" fill="#e0a84e">NVB</text>
+        <!-- cavernous nerves -->
+        <path d="M 82 180 Q 90 208 104 224" fill="none" stroke="#cf9b4a" stroke-width="1.6" stroke-linecap="round"/>
+        <path d="M 134 180 Q 126 208 112 224" fill="none" stroke="#cf9b4a" stroke-width="1.6" stroke-linecap="round"/>
+        <text x="150" y="206" font-size="8" fill="#c69a52">Cavernous</text>
+        <text x="150" y="216" font-size="8" fill="#c69a52">nerves</text>
+        <!-- crura / bulb -->
+        <ellipse cx="92" cy="238" rx="12" ry="8" fill="none" stroke="#b8c6d2" stroke-width="1"/>
+        <ellipse cx="124" cy="238" rx="12" ry="8" fill="none" stroke="#b8c6d2" stroke-width="1"/>
+        <ellipse cx="108" cy="246" rx="9" ry="6" fill="none" stroke="#b8c6d2" stroke-width="1"/>
+        <!-- current-location marker on the left NVB -->
+        <circle class="redpulse" cx="62" cy="132" r="10" fill="#e24b4a"/>
+        <circle cx="62" cy="132" r="4.5" fill="#ff3b3b" stroke="#fff" stroke-width="1.3"/>
+        <text x="4" y="150" font-size="8" fill="#ff7a7a">you are here</text>
+      </svg>
+      </div>
+      <img id="anatImg" alt="" style="display:none;max-width:100%;max-height:228px;border-radius:6px;"/>
+      <div id="anatDot" style="position:absolute;display:none;transform:translate(-50%,-50%);pointer-events:none;">
+        <div class="redpulse" style="position:absolute;left:-10px;top:-10px;width:20px;height:20px;border-radius:50%;background:#e24b4a;"></div>
+        <div style="position:relative;width:11px;height:11px;border-radius:50%;background:#ff3b3b;border:2px solid #fff;"></div>
+      </div>
+      <div id="anatMissing" style="display:none;font-size:10px;color:#9aa6b0;padding:34px 8px;">save image as<br><b id="anatFile"></b><br>in the Prototype folder</div>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:6px;">
+        <button id="anatPrev" style="padding:3px 11px;font-size:13px;">&#9664;</button>
+        <span id="anatName" style="font-size:12px;color:#cdd8e2;font-weight:500;">Sketch</span>
+        <button id="anatNext" style="padding:3px 11px;font-size:13px;">&#9654;</button>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:8px;">
+        <div class="imgtile" data-v="1">MRI</div><div class="imgtile" data-v="2">CT</div><div class="imgtile" data-v="3">X-ray</div>
+      </div>
+      <div style="font-size:10px;color:#8a96a0;margin-top:7px;">&#9664; &#9654; switch view &middot; load DICOM</div>
+    </div>
+
+    <div id="styletag">meter bar</div>
+
+    <div id="endcard"><div id="endinner">
+      <div style="color:#9aa0a6;font-size:12px;letter-spacing:.06em;">PROCEDURE COMPLETE &middot; 1-YEAR PREDICTION</div>
+      <div id="endbadge">&#10007;</div>
+      <div id="endtitle" style="font-size:21px;font-weight:500;color:#fff;">Erectile dysfunction</div>
+      <div id="endsub" style="font-size:13px;color:#f5b0b0;margin-top:2px;">predicted</div>
+      <div id="endstats">
+        <div><div id="sPeak" style="font-size:18px;font-weight:500;color:#fff;">4</div><div style="font-size:11px;color:#9aa0a6;">energy bursts</div></div>
+        <div><div id="sRed" style="font-size:18px;font-weight:500;color:#fff;">2.7s</div><div style="font-size:11px;color:#9aa0a6;">burn time</div></div>
+        <div><div id="sEF" style="font-size:18px;font-weight:500;color:#fff;">5 / 25</div><div style="font-size:11px;color:#9aa0a6;">final EF</div></div>
+      </div>
+      <button id="replay" style="margin-top:16px;">&#8635; Replay</button>
+    </div></div>
+
+    <div id="startgate" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(6,7,10,.9);pointer-events:auto;z-index:6;">
+      <div style="background:#0e141b;border:1px solid #2b3d4a;border-radius:14px;padding:28px 34px;text-align:center;">
+        <div style="font-size:18px;color:#fff;font-weight:500;">Enter baseline erectile function</div>
+        <div style="font-size:13px;color:#9aa0a6;margin:5px 0 18px;">SHIM score before surgery (0&#8211;25)</div>
+        <input id="baseGate" type="number" min="0" max="25" value="20" style="width:96px;font-size:26px;text-align:center;background:#1b212a;color:#fff;border:1px solid #333b47;border-radius:8px;padding:8px;"/>
+        <span style="color:#9aa0a6;font-size:18px;"> / 25</span>
+        <div><button id="startBtn" style="margin-top:20px;background:#1f8a4c;border-color:#2aa55e;color:#fff;font-size:15px;padding:9px 22px;">Start surgery &#9654;</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="controls">
+  <button id="play">&#9654; Play</button>
+  <button id="restart">&#8635; Restart</button>
+  <label style="font-size:13px;color:#9aa0a6;white-space:nowrap;">Baseline SHIM
+    <input id="baseline" type="number" min="0" max="25" step="1" value="20" style="width:54px;background:#1b212a;color:#e8eaed;border:1px solid #333b47;border-radius:6px;padding:5px 6px;font-size:14px;"/></label>
+  <input id="scrub" type="range" min="0" max="20" step="0.1" value="0"/>
+  <span class="clock" id="clock">0.0 / 20.0s</span>
+</div>
+<p class="hint">
+  <kbd>1</kbd> meter: bar &#8594; circle &#8594; off &nbsp; <kbd>2</kbd> segmentation &nbsp; <kbd>3</kbd> surgical phase &nbsp; <kbd>4</kbd> anatomy &nbsp; <kbd>Ctrl</kbd>+<kbd>Enter</kbd> panel &nbsp;&middot;&nbsp; <kbd>Space</kbd> play &nbsp; <kbd>C</kbd> calibration &nbsp; <kbd>F</kbd> fullscreen &nbsp;&middot;&nbsp; drag instruments / nerve onto the anatomy
+</p>
+
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const C=CONFIG, DUR=C.clipEnd-C.clipStart, CIRC=251.3;
+  const vid=$('vid'); vid.src=C.videoSrc;
+  $('scrub').max=DUR; $('cdur').textContent=DUR.toFixed(0);
+
+  const inAny=(t,arr)=>arr.some(([a,b])=>t>=a&&t<b);
+  const efBarCol=ef=> ef>=17?'#1d9e75':(ef>=10?'#ef9f27':'#e24b4a');  // SHIM health colour
+  const fmt=s=>{const m=Math.floor(s/60),x=Math.floor(s%60);return m+':'+(x<10?'0':'')+x;};
+
+  // EF drops only during the burn windows; flat between, floored at efFloor
+  let baselineEF=C.baselineEF;
+  const totalBurn=C.burns.reduce((s,b)=>s+(b[1]-b[0]),0);
+  const burnElapsed=t=>C.burns.reduce((s,b)=>s+Math.max(0,Math.min(t,b[1])-b[0]),0);
+  function efScore(t){ const fl=Math.min(C.efFloor,baselineEF); const dmg=(baselineEF-fl)*(totalBurn?burnElapsed(t)/totalBurn:0); return Math.round(Math.max(fl, baselineEF-dmg)); }
+
+  function refreshEFstat(){ $('sEF').textContent=efScore(DUR)+' / 25'; }
+  $('sPeak').textContent=C.burns.length; $('sRed').textContent=totalBurn.toFixed(1)+'s'; refreshEFstat();
+
+  let meterMode='bar', segOn=false, phaseOn=false, anatomyOn=false, panelOn=false;
+  let forced=false, ended=false, soundOn=false, beeped=false;
+
+  function setSw(k,on){ const r=document.querySelector('.swrow[data-k="'+k+'"]'); if(r) r.querySelector('.sw').className='sw '+(on?'on':'off'); }
+  function applyVisibility(){
+    $('meterBar').style.display=(meterMode==='bar')?'block':'none';
+    $('meterCircle').style.display=(meterMode==='circle')?'block':'none';
+    $('seg').style.display=segOn?'block':'none';
+    $('panel').style.display=panelOn?'block':'none';
+    $('phasePanel').style.display=phaseOn?'flex':'none';
+    $('anatomyPanel').style.display=anatomyOn?'block':'none';
+    setSw('meter',meterMode!=='none'); setSw('seg',segOn); setSw('phase',phaseOn); setSw('anatomy',anatomyOn); setSw('sound',soundOn);
+    $('styletag').textContent='meter '+meterMode+(segOn?' · seg':'')+(phaseOn?' · phase':'')+(anatomyOn?' · anatomy':'');
+  }
+
+  function render(){
+    let abs=vid.currentTime, t=abs-C.clipStart; if(t<0)t=0; if(t>DUR)t=DUR;
+    const efS=efScore(t), e=inAny(t,C.burns), alert=(e||forced), efc=efBarCol(efS);
+
+    // EF (SHIM /25) drains from baseline; bar and ring both DROP as function is lost
+    $('efFill').style.width=(efS/25*100)+'%'; $('efFill').style.background=efc;
+    $('barNumV').textContent=efS; $('barNumV').style.color=efS<C.efIntact?'#f0999b':'#fff';
+    $('cFill').setAttribute('stroke-dashoffset', CIRC*(1-efS/25));
+    $('cFill').setAttribute('stroke', efc);
+    $('cEF').textContent=efS; $('cEF').setAttribute('fill', efS<C.efIntact?'#f0999b':'#fff');
+
+    if(efS<10){ $('edge').style.borderColor='#e24b4a'; $('edge').style.boxShadow='inset 0 0 55px rgba(226,75,74,.4)'; }
+    else if(efS<C.efIntact){ $('edge').style.borderColor='#ef9f27'; $('edge').style.boxShadow='inset 0 0 35px rgba(239,159,39,.22)'; }
+    else { $('edge').style.borderColor='transparent'; $('edge').style.boxShadow='none'; }
+
+    if(segOn){
+      $('nerveGlow').style.display=alert?'':'none';
+      $('nerveGlow').classList.toggle('glow', alert);
+      $('instrL').classList.toggle('energized', e);
+    }
+    if(phaseOn){ const rem=Math.max(0,Math.round(44 - t*0.4)); $('phaseTime').textContent='~ '+rem+' min'; $('phaseFill').style.height=(58+(t/DUR)*6)+'%'; }
+
+    if(soundOn && alert && !beeped){ beep(); beeped=true; } if(!alert) beeped=false;
+
+    $('crel').textContent=t.toFixed(1); $('cabs').textContent=fmt(abs);
+    $('clock').textContent=t.toFixed(1)+' / '+DUR.toFixed(1)+'s';
+    if(document.activeElement!==$('scrub')) $('scrub').value=t;
+    if(abs>=C.clipEnd && !ended) endClip();
+    requestAnimationFrame(render);
+  }
+
+  function endClip(){ ended=true; vid.pause(); $('play').innerHTML='&#9654; Play';
+    refreshEFstat();
+    const good=efScore(DUR)>=C.efIntact, inner=$('endinner'); inner.className=good?'good':'';
+    $('endbadge').innerHTML=good?'&#10003;':'&#10007;';
+    $('endtitle').textContent=good?'Function preserved':'Erectile dysfunction';
+    $('endsub').style.color=good?'#9fe1cb':'#f5b0b0'; $('endcard').style.display='flex'; }
+
+  let actx;
+  function beep(){ try{ actx=actx||new (window.AudioContext||window.webkitAudioContext)();
+    const o=actx.createOscillator(),g=actx.createGain(); o.frequency.value=880; o.connect(g); g.connect(actx.destination);
+    g.gain.setValueAtTime(0.0001,actx.currentTime); g.gain.exponentialRampToValueAtTime(0.2,actx.currentTime+0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001,actx.currentTime+0.4); o.start(); o.stop(actx.currentTime+0.4);}catch(e){} }
+
+  function showGate(){ ended=false; $('endcard').style.display='none'; vid.pause(); vid.currentTime=C.clipStart; $('play').innerHTML='&#9654; Play'; $('startgate').style.display='flex'; }
+  function startSurgery(){ baselineEF=Math.max(0,Math.min(25, parseInt($('baseGate').value)||0)); $('baseline').value=baselineEF; refreshEFstat(); $('startgate').style.display='none'; ended=false; $('endcard').style.display='none'; vid.currentTime=C.clipStart; vid.play(); $('play').innerHTML='&#10073;&#10073; Pause'; }
+  vid.addEventListener('loadedmetadata',()=>{ vid.currentTime=C.clipStart; applyVisibility(); requestAnimationFrame(render); });
+  $('startBtn').addEventListener('click', startSurgery);
+  $('play').addEventListener('click',()=>{ if($('startgate').style.display!=='none'){ startSurgery(); return; } if(ended){ showGate(); return; } if(vid.paused){vid.play();$('play').innerHTML='&#10073;&#10073; Pause';}else{vid.pause();$('play').innerHTML='&#9654; Play';} });
+  $('restart').addEventListener('click', showGate); $('replay').addEventListener('click', showGate);
+  $('scrub').addEventListener('input',()=>{ if(ended){ended=false;$('endcard').style.display='none';} vid.currentTime=C.clipStart+parseFloat($('scrub').value); });
+  $('baseline').addEventListener('input',()=>{ baselineEF=Math.max(0,Math.min(25, parseInt($('baseline').value)||0)); $('baseGate').value=baselineEF; refreshEFstat(); });
+
+  document.addEventListener('keydown',e=>{ if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return; const k=e.key.toLowerCase();
+    if(k==='enter'&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); panelOn=!panelOn; applyVisibility(); return; }
+    if(k==='1'){ meterMode = meterMode==='bar'?'circle':(meterMode==='circle'?'none':'bar'); applyVisibility(); }
+    if(k==='2'){ segOn=!segOn; applyVisibility(); }
+    if(k==='3'){ phaseOn=!phaseOn; applyVisibility(); }
+    if(k==='4'){ anatomyOn=!anatomyOn; applyVisibility(); }
+    if((k==='arrowleft'||k==='arrowright')&&anatomyOn){ e.preventDefault(); showAnat(anatIdx+(k==='arrowright'?1:-1)); }
+    if(k==='c'){$('cal').style.display=$('cal').style.display==='block'?'none':'block';}
+    if(k==='a'){forced=true;}
+    if(k==='f'){ if(!document.fullscreenElement)$('stage').requestFullscreen(); else document.exitFullscreen(); }
+    if(k===' '){ e.preventDefault(); $('play').click(); }
+  });
+  document.addEventListener('keyup',e=>{ if(e.key.toLowerCase()==='a')forced=false; });
+
+  document.querySelectorAll('.swrow').forEach(row=>{ row.addEventListener('click',()=>{ const key=row.dataset.k;
+    if(key==='meter'){ meterMode = (meterMode==='none')?'bar':'none'; }
+    else if(key==='seg'){ segOn=!segOn; }
+    else if(key==='phase'){ phaseOn=!phaseOn; }
+    else if(key==='anatomy'){ anatomyOn=!anatomyOn; }
+    else if(key==='sound'){ soundOn=!soundOn; }
+    applyVisibility(); }); });
+
+  function makeDraggable(g){ let drag=false,ox,oy,tx=0,ty=0;
+    g.addEventListener('mousedown',e=>{drag=true;ox=e.clientX;oy=e.clientY;e.preventDefault();e.stopPropagation();});
+    window.addEventListener('mousemove',e=>{ if(!drag)return; const s=$('stage').getBoundingClientRect();
+      tx+=(e.clientX-ox)/s.width*640; ty+=(e.clientY-oy)/s.height*360; ox=e.clientX;oy=e.clientY;
+      g.setAttribute('transform','translate('+tx+','+ty+')'); });
+    window.addEventListener('mouseup',()=>drag=false); }
+  ['instrL','instrR','nerve'].forEach(id=>makeDraggable($(id)));
+
+  // anatomy multi-view (sketch / MRI / CT / X-ray); red dot marks our location on each
+  const ANAT=[
+    {name:'Sketch', type:'svg'},
+    {name:'MRI',   type:'img', src:'anat-mri.jpg',  dot:[37,58]},
+    {name:'CT',    type:'img', src:'anat-ct.jpg',   dot:[28,60]},
+    {name:'X-ray', type:'img', src:'anat-xray.jpg', dot:[43,52]},
+  ];
+  let anatIdx=0;
+  function showAnat(i){
+    anatIdx=((i%ANAT.length)+ANAT.length)%ANAT.length;
+    const v=ANAT[anatIdx]; $('anatName').textContent=v.name;
+    if(v.type==='svg'){ $('anatSketch').style.display=''; $('anatImg').style.display='none'; $('anatDot').style.display='none'; $('anatMissing').style.display='none'; return; }
+    $('anatSketch').style.display='none'; $('anatMissing').style.display='none';
+    const img=$('anatImg'); img.style.display='';
+    img.onload=()=>{ $('anatDot').style.display='block'; $('anatDot').style.left=v.dot[0]+'%'; $('anatDot').style.top=v.dot[1]+'%'; };
+    img.onerror=()=>{ img.style.display='none'; $('anatDot').style.display='none'; $('anatFile').textContent=v.src; $('anatMissing').style.display='block'; };
+    img.src=v.src;
+  }
+  $('anatPrev').addEventListener('click',()=>showAnat(anatIdx-1));
+  $('anatNext').addEventListener('click',()=>showAnat(anatIdx+1));
+  document.querySelectorAll('.imgtile').forEach(t=>t.addEventListener('click',()=>showAnat(parseInt(t.dataset.v))));
+  showAnat(0);
+})();
+</script>
+</body>
+</html>
